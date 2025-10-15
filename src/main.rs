@@ -40,19 +40,14 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 #[gatt_server]
 struct Server {
-    battery_service: BatteryService,
+    digits_service: DigitsService,
 }
 
 /// Battery service
-#[gatt_service(uuid = service::BATTERY)]
-struct BatteryService {
-    /// Battery Level
-    #[descriptor(uuid = descriptors::VALID_RANGE, read, value = [0, 100])]
-    #[descriptor(uuid = descriptors::MEASUREMENT_DESCRIPTION, name = "hello", read, value = "Battery Level")]
-    #[characteristic(uuid = characteristic::BATTERY_LEVEL, read, notify, value = 10)]
-    level: u8,
-    #[characteristic(uuid = "408813df-5dd4-1f87-ec11-cdb001100000", write, read, notify)]
-    status: bool,
+#[gatt_service(uuid = "a5bad9f2-700a-4c3d-b9e2-e58ad262d40e")]
+struct DigitsService {
+    #[characteristic(uuid = "a5178cad-e4e0-4598-8053-a4a78b9281e2", write)]
+    digits: u64,
 }
 
 #[esp_rtos::main]
@@ -157,8 +152,8 @@ where
 
     info!("Starting advertising and GATT service");
     let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
-        name: "TrouBLE",
-        appearance: &appearance::power_device::GENERIC_POWER_DEVICE,
+        name: "FkmDisplay",
+        appearance: &appearance::display_equipment::GENERIC_DISPLAY_EQUIPMENT,
     }))
     .unwrap();
 
@@ -199,7 +194,7 @@ async fn gatt_events_task(
     conn: &GattConnection<'_, '_, DefaultPacketPool>,
     bond_stored: &mut bool,
 ) -> core::result::Result<(), Error> {
-    let level = server.battery_service.level;
+    let digits = server.digits_service.digits;
     let reason = loop {
         match conn.next().await {
             GattConnectionEvent::Disconnected { reason } => break reason,
@@ -219,11 +214,14 @@ async fn gatt_events_task(
             }
             GattConnectionEvent::Gatt { event } => {
                 let result = match &event {
-                    GattEvent::Read(event) => {
-                        if event.handle() == level.handle {
-                            let value = server.get(&level);
+                    GattEvent::Read(_event) => {
+                        /*
+                        if event.handle() == digits.handle {
+                            let value = server.get(&digits);
                             info!("[gatt] Read Event to Level Characteristic: {:?}", value);
                         }
+                        */
+
                         if conn.raw().security_level()?.encrypted() {
                             None
                         } else {
@@ -231,7 +229,7 @@ async fn gatt_events_task(
                         }
                     }
                     GattEvent::Write(event) => {
-                        if event.handle() == level.handle {
+                        if event.handle() == digits.handle {
                             info!(
                                 "[gatt] Write Event to Level Characteristic: {:?}",
                                 event.data()
@@ -293,19 +291,11 @@ async fn advertise<'values, 'server, C: Controller>(
 }
 
 async fn custom_task<C: Controller, P: PacketPool>(
-    server: &Server<'_>,
+    _server: &Server<'_>,
     conn: &GattConnection<'_, '_, P>,
     stack: &Stack<'_, C, P>,
 ) {
-    let mut tick: u8 = 0;
-    let level = server.battery_service.level;
     loop {
-        tick = tick.wrapping_add(1);
-        info!("[custom_task] notifying connection of tick {}", tick);
-        if level.notify(conn, &tick).await.is_err() {
-            info!("[custom_task] error notifying connection");
-            break;
-        };
         // read RSSI (Received Signal Strength Indicator) of the connection.
         if let Ok(rssi) = conn.raw().rssi(stack).await {
             info!("[custom_task] RSSI: {:?}", rssi);
@@ -313,6 +303,7 @@ async fn custom_task<C: Controller, P: PacketPool>(
             info!("[custom_task] error getting RSSI");
             break;
         };
+
         Timer::after_secs(2).await;
     }
 }
