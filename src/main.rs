@@ -163,8 +163,9 @@ where
     .unwrap();
 
     let _ = embassy_futures::join::join(ble_task(runner), async {
+        let hostname = alloc::format!("FKMD-{:X}", get_efuse_u32());
         loop {
-            match advertise("Trouble Example", &mut peripheral, &server).await {
+            match advertise(&hostname, &mut peripheral, &server).await {
                 Ok(conn) => {
                     // Allow bondable if no bond is stored.
                     conn.raw().set_bondable(!bond_stored).unwrap();
@@ -263,7 +264,7 @@ async fn gatt_events_task(
 }
 
 async fn advertise<'values, 'server, C: Controller>(
-    name: &'values str,
+    name: &str,
     peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
     server: &'server Server<'values>,
 ) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
@@ -314,4 +315,23 @@ async fn custom_task<C: Controller, P: PacketPool>(
         };
         Timer::after_secs(2).await;
     }
+}
+
+pub fn get_efuse_mac() -> u64 {
+    esp_hal::efuse::Efuse::mac_address()
+        .iter()
+        .fold(0u64, |acc, &x| (acc << 8) + x as u64)
+}
+
+pub fn get_efuse_u32() -> u32 {
+    let mut efuse = get_efuse_mac();
+    efuse = (!efuse).wrapping_add(efuse << 18);
+    efuse = efuse ^ (efuse >> 31);
+    efuse = efuse.wrapping_mul(21);
+    efuse = efuse ^ (efuse >> 11);
+    efuse = efuse.wrapping_add(efuse << 6);
+    efuse = efuse ^ (efuse >> 22);
+
+    let mac = efuse & 0x000000007FFFFFFF;
+    mac as u32
 }
