@@ -135,13 +135,13 @@ where
         .set_random_address(address)
         .set_random_generator_seed(&mut OsRng);
 
-    let mut bond_stored = if let Some(bond_info) = load_bonding_info(nvs).await {
+    let mut bond_info = if let Some(bond_info) = load_bonding_info(nvs).await {
         info!("Loaded bond information");
-        stack.add_bond_information(bond_info).unwrap();
-        true
+        stack.add_bond_information(bond_info.clone()).unwrap();
+        Some(bond_info)
     } else {
         info!("No bond information found");
-        false
+        None
     };
 
     let Host {
@@ -160,12 +160,20 @@ where
     let _ = embassy_futures::join::join(ble_task(runner), async {
         let hostname = alloc::format!("FKMD-{:X}", get_efuse_u32());
         loop {
-            match advertise(&hostname, &mut peripheral, &server).await {
+            match advertise(&hostname, &mut peripheral, &server, &bond_info).await {
                 Ok(conn) => {
+                    if let Some(bond) = &bond_info {
+                        if conn.raw().peer_address() != bond.identity.bd_addr.into() {
+                            info!("Rejecting connection from unknown device");
+                            conn.raw().disconnect();
+                            continue;
+                        }
+                    }
+
                     // Allow bondable if no bond is stored.
-                    conn.raw().set_bondable(!bond_stored).unwrap();
+                    conn.raw().set_bondable(bond_info.is_none()).unwrap();
                     // set up tasks when the connection is established to a central, so they don't run when no one is connected.
-                    let a = gatt_events_task(&nvs, &server, &conn, &mut bond_stored);
+                    let a = gatt_events_task(&nvs, &server, &conn, &mut bond_info);
                     let b = custom_task(&server, &conn, &stack);
                     // run until any task ends (usually because the connection has been closed),
                     // then return to advertising state.
@@ -192,7 +200,7 @@ async fn gatt_events_task(
     nvs: &Nvs,
     server: &Server<'_>,
     conn: &GattConnection<'_, '_, DefaultPacketPool>,
-    bond_stored: &mut bool,
+    bond_info: &mut Option<BondInformation>,
 ) -> core::result::Result<(), Error> {
     let digits = server.digits_service.digits;
     let reason = loop {
@@ -205,7 +213,7 @@ async fn gatt_events_task(
                 info!("[gatt] pairing complete: {:?}", security_level);
                 if let Some(bond) = bond {
                     store_bonding_info(nvs, &bond).await;
-                    *bond_stored = true;
+                    *bond_info = Some(bond);
                     info!("Bond information stored");
                 }
             }
@@ -265,26 +273,40 @@ async fn advertise<'values, 'server, C: Controller>(
     name: &str,
     peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
     server: &'server Server<'values>,
+    bond_info: &Option<BondInformation>,
 ) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
-    let mut advertiser_data = [0; 31];
-    let len = AdStructure::encode_slice(
-        &[
-            AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
-            AdStructure::ServiceUuids16(&[[0x0f, 0x18]]),
-            AdStructure::CompleteLocalName(name.as_bytes()),
-        ],
-        &mut advertiser_data[..],
-    )?;
-    let advertiser = peripheral
-        .advertise(
-            &Default::default(),
-            Advertisement::ConnectableScannableUndirected {
-                adv_data: &advertiser_data[..len],
-                scan_data: &[],
-            },
-        )
-        .await?;
-    info!("[adv] advertising");
+    let advertiser = if let Some(bond) = bond_info {
+        info!("[adv] advertising directed");
+        peripheral
+            .advertise(
+                &Default::default(),
+                Advertisement::ConnectableNonscannableDirectedHighDuty {
+                    peer: Address::random(bond.identity.bd_addr.raw().try_into().unwrap()),
+                },
+            )
+            .await?
+    } else {
+        let mut advertiser_data = [0; 31];
+        let len = AdStructure::encode_slice(
+            &[
+                AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+                AdStructure::ServiceUuids16(&[[0x0f, 0x18]]),
+                AdStructure::CompleteLocalName(name.as_bytes()),
+            ],
+            &mut advertiser_data[..],
+        )?;
+        info!("[adv] advertising undirected");
+        peripheral
+            .advertise(
+                &Default::default(),
+                Advertisement::ConnectableScannableUndirected {
+                    adv_data: &advertiser_data[..len],
+                    scan_data: &[],
+                },
+            )
+            .await?
+    };
+
     let conn = advertiser.accept().await?.with_attribute_server(server)?;
     info!("[adv] connection established");
     Ok(conn)
