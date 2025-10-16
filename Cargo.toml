@@ -55,6 +55,12 @@ serde = { version = "1.0.228", default-features = false, features = ["alloc", "d
 serde_json = { version = "1.0.145", default-features = false, features = ["alloc"] }
 getrandom = { version = "=0.2.15", features = ["custom"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+heapless = "0.9.1"
+
+ag-lcd-async = { git = "https://github.com/filipton/ag-lcd-async", features = [] }
+adv-shift-registers = "0.2.5"
+embedded-hal = "1.0.0"
+embedded-hal-async = "1.0.0"
 
 
 [profile.dev]

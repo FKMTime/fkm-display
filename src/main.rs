@@ -6,12 +6,18 @@
     holding buffers for the duration of a data transfer."
 )]
 
+use crate::lcd_abstract::{LcdAbstract, PrintAlign};
 use crate::nvs::Nvs;
+use adv_shift_registers::wrappers::{ShifterPin, ShifterValue};
+use ag_lcd_async::LcdDisplay;
+use alloc::string::{String, ToString as _};
 use bt_hci::controller::ExternalController;
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Delay, Duration, Timer};
+use embedded_hal::digital::OutputPin;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
+use esp_hal::gpio::{Level, Output};
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::ble::controller::BleConnector;
 use log::info;
@@ -19,6 +25,7 @@ use rand_core::OsRng;
 use trouble_host::prelude::*;
 extern crate alloc;
 
+mod lcd_abstract;
 mod nvs;
 
 pub fn custom_rng(buf: &mut [u8]) -> Result<(), getrandom::Error> {
@@ -66,10 +73,53 @@ async fn main(spawner: Spawner) -> ! {
 
     let nvs = nvs::Nvs::new_from_part_table(peripherals.FLASH).unwrap();
 
+    let shifter_data_pin = Output::new(peripherals.GPIO10, Level::Low, Default::default());
+    let shifter_latch_pin = Output::new(peripherals.GPIO1, Level::Low, Default::default());
+    let shifter_clk_pin = Output::new(peripherals.GPIO21, Level::Low, Default::default());
+
+    let adv_shift_reg = adv_shift_registers::AdvancedShiftRegister::<8, _>::new(
+        shifter_data_pin,
+        shifter_clk_pin,
+        shifter_latch_pin,
+        0,
+    );
+    let adv_shift_reg = alloc::boxed::Box::new(adv_shift_reg);
+    let adv_shift_reg = alloc::boxed::Box::leak(adv_shift_reg);
+
+    let mut backlight = adv_shift_reg.get_pin_mut(1, 1, false);
+    _ = backlight.set_high();
+    let lcd = adv_shift_reg.get_shifter_mut(1);
+
+    let mut lcd = {
+        let bl_pin = lcd.get_pin_mut(1, true);
+        let rs_pin = lcd.get_pin_mut(2, true);
+        let en_pin = lcd.get_pin_mut(3, true);
+        let d4_pin = lcd.get_pin_mut(4, false);
+        let d5_pin = lcd.get_pin_mut(5, false);
+        let d6_pin = lcd.get_pin_mut(6, false);
+        let d7_pin = lcd.get_pin_mut(7, false);
+        LcdDisplay::new(rs_pin, en_pin, Delay)
+            .with_display(ag_lcd_async::Display::On)
+            .with_blink(ag_lcd_async::Blink::Off)
+            .with_cursor(ag_lcd_async::Cursor::Off)
+            .with_size(ag_lcd_async::Size::Dots5x8)
+            .with_cols(16)
+            .with_lines(ag_lcd_async::Lines::TwoLines)
+            .with_half_bus(d4_pin, d5_pin, d6_pin, d7_pin)
+            .with_backlight(bl_pin)
+            .build()
+            .await
+    };
+
+    lcd.clear().await;
+    lcd.backlight_on();
+
+    let lcd_driver: LcdAbstract<80, 16, 2, 3> = LcdAbstract::new();
+
     let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
     let transport = BleConnector::new(&radio_init, peripherals.BT, Default::default()).unwrap();
     let ble_controller = ExternalController::<_, 20>::new(transport);
-    run(ble_controller, &nvs).await;
+    run(ble_controller, &nvs, lcd_driver, lcd).await;
 
     loop {
         info!("Hello world!");
@@ -123,8 +173,12 @@ async fn load_bonding_info(nvs: &Nvs) -> Option<BondInformation> {
     });
 }
 
-pub async fn run<C>(controller: C, nvs: &Nvs)
-where
+pub async fn run<C>(
+    controller: C,
+    nvs: &Nvs,
+    mut lcd: LcdAbstract<80, 16, 2, 3>,
+    mut lcd_raw: LcdDisplay<ShifterPin, Delay>,
+) where
     C: Controller,
 {
     let address: Address = Address::random(esp_hal::efuse::Efuse::mac_address());
@@ -141,6 +195,8 @@ where
         Some(bond_info)
     } else {
         info!("No bond information found");
+        _ = lcd.print(0, "Connect To FKM", PrintAlign::Center, true);
+        lcd.display_on_lcd(&mut lcd_raw).await;
         None
     };
 
@@ -160,7 +216,16 @@ where
     let _ = embassy_futures::join::join(ble_task(runner), async {
         let hostname = alloc::format!("FKMD-{:X}", get_efuse_u32());
         loop {
-            match advertise(&hostname, &mut peripheral, &server, &bond_info).await {
+            match advertise(
+                &hostname,
+                &mut peripheral,
+                &server,
+                &bond_info,
+                &mut lcd,
+                &mut lcd_raw,
+            )
+            .await
+            {
                 Ok(conn) => {
                     if let Some(bond) = &bond_info {
                         if conn.raw().peer_address() != bond.identity.bd_addr.into() {
@@ -171,9 +236,16 @@ where
                     }
 
                     // Allow bondable if no bond is stored.
-                    conn.raw().set_bondable(bond_info.is_none()).unwrap();
+                    _ = conn.raw().set_bondable(bond_info.is_none());
                     // set up tasks when the connection is established to a central, so they don't run when no one is connected.
-                    let a = gatt_events_task(&nvs, &server, &conn, &mut bond_info);
+                    let a = gatt_events_task(
+                        &nvs,
+                        &server,
+                        &conn,
+                        &mut bond_info,
+                        &mut lcd,
+                        &mut lcd_raw,
+                    );
                     let b = custom_task(&server, &conn, &stack);
                     // run until any task ends (usually because the connection has been closed),
                     // then return to advertising state.
@@ -201,6 +273,8 @@ async fn gatt_events_task(
     server: &Server<'_>,
     conn: &GattConnection<'_, '_, DefaultPacketPool>,
     bond_info: &mut Option<BondInformation>,
+    lcd: &mut LcdAbstract<80, 16, 2, 3>,
+    lcd_raw: &mut LcdDisplay<ShifterPin, Delay>,
 ) -> core::result::Result<(), Error> {
     let digits = server.digits_service.digits;
     let reason = loop {
@@ -215,6 +289,8 @@ async fn gatt_events_task(
                     store_bonding_info(nvs, &bond).await;
                     *bond_info = Some(bond);
                     info!("Bond information stored");
+                    _ = lcd.print(0, "Connected", PrintAlign::Center, true);
+                    lcd.display_on_lcd(lcd_raw).await;
                 }
             }
             GattConnectionEvent::PairingFailed(err) => {
@@ -238,10 +314,11 @@ async fn gatt_events_task(
                     }
                     GattEvent::Write(event) => {
                         if event.handle() == digits.handle {
-                            info!(
-                                "[gatt] Write Event to Level Characteristic: {:?}",
-                                event.data()
-                            );
+                            let ms: u64 = u64::from_be_bytes(event.data().try_into().unwrap());
+                            let time_str = ms_to_time_str(ms);
+                            log::info!("Display Time: {time_str}");
+                            _ = lcd.print(0, &time_str, PrintAlign::Center, true);
+                            lcd.display_on_lcd(lcd_raw).await;
                         }
                         if conn.raw().security_level()?.encrypted() {
                             None
@@ -266,6 +343,8 @@ async fn gatt_events_task(
         }
     };
     info!("[gatt] disconnected: {:?}", reason);
+    _ = lcd.print(0, "Disconnected", PrintAlign::Center, true);
+    lcd.display_on_lcd(lcd_raw).await;
     Ok(())
 }
 
@@ -274,6 +353,8 @@ async fn advertise<'values, 'server, C: Controller>(
     peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
     server: &'server Server<'values>,
     bond_info: &Option<BondInformation>,
+    lcd: &mut LcdAbstract<80, 16, 2, 3>,
+    lcd_raw: &mut LcdDisplay<ShifterPin, Delay>,
 ) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
     let advertiser = if let Some(bond) = bond_info {
         info!("[adv] advertising directed");
@@ -309,6 +390,8 @@ async fn advertise<'values, 'server, C: Controller>(
 
     let conn = advertiser.accept().await?.with_attribute_server(server)?;
     info!("[adv] connection established");
+    _ = lcd.print(0, "Connected", PrintAlign::Center, true);
+    lcd.display_on_lcd(lcd_raw).await;
     Ok(conn)
 }
 
@@ -347,4 +430,19 @@ pub fn get_efuse_u32() -> u32 {
 
     let mac = efuse & 0x000000007FFFFFFF;
     mac as u32
+}
+
+pub fn ms_to_time_str(ms: u64) -> heapless::String<12> {
+    let minutes: u8 = (ms / 60000) as u8;
+    let seconds: u8 = ((ms % 60000) / 1000) as u8;
+    let ms: u16 = (ms % 1000) as u16;
+
+    let mut time_str = heapless::String::<12>::new();
+    if minutes > 0 {
+        _ = time_str.push_str(&alloc::format!("{minutes}:{seconds:02}.{ms:03}"));
+    } else {
+        _ = time_str.push_str(&alloc::format!("{seconds:01}.{ms:03}"));
+    }
+
+    time_str
 }

@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "adv-shift-registers"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "519bc9536b1d6a133dfc208cbf1a0e5ac6ccac1fe0c0ce5f44f5a43f85096bc8"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "log",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11,6 +21,15 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+]
+
+[[package]]
+name = "ag-lcd-async"
+version = "0.3.0"
+source = "git+https://github.com/filipton/ag-lcd-async#c4834c24769bfb0c5c597c71c675b9f0b6305bf3"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
 ]
 
 [[package]]
@@ -945,12 +964,16 @@ dependencies = [
 name = "fkm-display"
 version = "0.1.0"
 dependencies = [
+ "adv-shift-registers",
+ "ag-lcd-async",
  "bt-hci",
  "critical-section",
  "embassy-executor",
  "embassy-futures",
  "embassy-sync 0.7.2",
  "embassy-time",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
  "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
  "embedded-storage",
@@ -963,6 +986,7 @@ dependencies = [
  "esp-rtos",
  "esp-storage",
  "getrandom",
+ "heapless 0.9.1",
  "log",
  "portable-atomic",
  "rand_core 0.6.4",
