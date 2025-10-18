@@ -8,9 +8,8 @@
 
 use crate::lcd_abstract::{LcdAbstract, PrintAlign};
 use crate::nvs::Nvs;
-use adv_shift_registers::wrappers::{ShifterPin, ShifterValue};
+use adv_shift_registers::wrappers::{ShifterPin, ShifterValue, ShifterValueRange};
 use ag_lcd_async::LcdDisplay;
-use alloc::string::{String, ToString as _};
 use bt_hci::controller::ExternalController;
 use embassy_executor::Spawner;
 use embassy_time::{Delay, Duration, Timer};
@@ -89,6 +88,8 @@ async fn main(spawner: Spawner) -> ! {
     let mut backlight = adv_shift_reg.get_pin_mut(1, 1, false);
     _ = backlight.set_high();
     let lcd = adv_shift_reg.get_shifter_mut(1);
+    let digits_shifters = adv_shift_reg.get_shifter_range_mut(2..8);
+    digits_shifters.set_data(&[!DEC_DIGITS[8] ^ DOT_MOD; 6]);
 
     let mut lcd = {
         let bl_pin = lcd.get_pin_mut(1, true);
@@ -119,7 +120,7 @@ async fn main(spawner: Spawner) -> ! {
     let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
     let transport = BleConnector::new(&radio_init, peripherals.BT, Default::default()).unwrap();
     let ble_controller = ExternalController::<_, 20>::new(transport);
-    run(ble_controller, &nvs, lcd_driver, lcd).await;
+    run(ble_controller, &nvs, lcd_driver, lcd, digits_shifters).await;
 
     loop {
         info!("Hello world!");
@@ -178,6 +179,7 @@ pub async fn run<C>(
     nvs: &Nvs,
     mut lcd: LcdAbstract<80, 16, 2, 3>,
     mut lcd_raw: LcdDisplay<ShifterPin, Delay>,
+    display: ShifterValueRange,
 ) where
     C: Controller,
 {
@@ -245,11 +247,13 @@ pub async fn run<C>(
                         &mut bond_info,
                         &mut lcd,
                         &mut lcd_raw,
+                        &display,
                     );
-                    let b = custom_task(&server, &conn, &stack);
+                    //let b = custom_task(&server, &conn, &stack);
                     // run until any task ends (usually because the connection has been closed),
                     // then return to advertising state.
-                    embassy_futures::select::select(a, b).await;
+                    //embassy_futures::select::select(a, b).await;
+                    _ = a.await;
                 }
                 Err(e) => {
                     panic!("[adv] error: {:?}", e);
@@ -275,6 +279,7 @@ async fn gatt_events_task(
     bond_info: &mut Option<BondInformation>,
     lcd: &mut LcdAbstract<80, 16, 2, 3>,
     lcd_raw: &mut LcdDisplay<ShifterPin, Delay>,
+    display: &ShifterValueRange,
 ) -> core::result::Result<(), Error> {
     let digits = server.digits_service.digits;
     let reason = loop {
@@ -319,6 +324,7 @@ async fn gatt_events_task(
                             log::info!("Display Time: {time_str}");
                             _ = lcd.print(0, &time_str, PrintAlign::Center, true);
                             lcd.display_on_lcd(lcd_raw).await;
+                            display.set_data(&time_str_to_display(&time_str));
                         }
                         if conn.raw().security_level()?.encrypted() {
                             None
@@ -445,4 +451,26 @@ pub fn ms_to_time_str(ms: u64) -> heapless::String<12> {
     }
 
     time_str
+}
+
+pub const DEC_DIGITS: [u8; 10] = [215, 132, 203, 206, 156, 94, 95, 196, 223, 222];
+pub const DOT_MOD: u8 = 32;
+
+pub fn time_str_to_display(time: &str) -> [u8; 6] {
+    let mut data = [255; 6];
+    let mut i = 0;
+
+    for c in time.chars().rev() {
+        if !c.is_ascii_digit() {
+            continue;
+        }
+
+        let dot = if i == 5 || i == 3 { DOT_MOD } else { 0 };
+
+        let d = c as u8 - b'0';
+        data[i] = !DEC_DIGITS[d as usize] ^ dot;
+        i += 1;
+    }
+
+    data
 }
